@@ -36,6 +36,10 @@ const WIDTH_STEP: i64 = 10;
 const MIN_TEXTWIDTH: i64 = 20;
 /// Width of the widest progress indicator, "100.0%".
 const PROGRESS_MAX_WIDTH: i64 = 6;
+/// Padding levels the TopPadding/BottomPadding keys cycle through.
+const PADDING_LEVELS: [i64; 4] = [0, 2, 4, 8];
+/// Fewest text rows a padding change may leave.
+const MIN_TEXT_ROWS: i64 = 3;
 
 pub enum ReadOutcome {
     State(ReadingState),
@@ -154,14 +158,12 @@ fn parse_percent(input: &str) -> Option<f64> {
     (p.is_finite() && (0.0..=100.0).contains(&p)).then_some(p)
 }
 
-/// Row to show so that the progress indicator (which counts letters up to
-/// the bottom of the page) reads `target` letters. `letters_prefix[i]` is the
-/// number of letters in the first `i` lines; `page` is the number of lines
-/// on screen minus one.
-fn row_for_letters(letters_prefix: &[usize], target: usize, page: i64) -> i64 {
-    let k = letters_prefix.partition_point(|&p| p < target) as i64;
-    let last_row = (letters_prefix.len() as i64 - 2).max(0);
-    (k - page).clamp(0, last_row)
+/// Row to put at the top of the page so that the progress indicator (which
+/// counts the letters before the top of the page) reads at least `target`.
+/// `letters_prefix[i]` is the number of letters in the first `i` lines.
+fn row_for_letters(letters_prefix: &[usize], target: usize, max_row: i64) -> i64 {
+    let row = letters_prefix.partition_point(|&p| p < target) as i64;
+    row.clamp(0, max_row.max(0))
 }
 
 fn letters_prefix_of(lines: &[String]) -> Vec<usize> {
@@ -204,13 +206,20 @@ pub struct Reader<'t> {
     color_pair: u8,
     /// only used when seamless
     totlines_per_content: Vec<usize>,
-    /// rows reserved above the text for the progress indicator
+    /// blank rows above the text, as set by the user
+    pad_top: i64,
+    /// blank rows below the text
+    pad_bottom: i64,
+    /// rows actually reserved above the text: `pad_top`, or 1 if that is 0
+    /// and the progress indicator needs its own row
     top_pad: i64,
 }
 
 impl<'t> Reader<'t> {
     pub fn new(term: &'t mut DefaultTerminal, ebook: Box<dyn Ebook>, config: Config, state: State) -> Self {
         let keymap = config.keymap;
+        let pad_top = config.setting.top_padding.max(0);
+        let pad_bottom = config.setting.bottom_padding.max(0);
         let mut win_keys = vec![Key::Resize];
         for a in [Action::TableOfContents, Action::Metadata, Action::Help] {
             win_keys.extend_from_slice(keymap.get(a));
@@ -241,6 +250,8 @@ impl<'t> Reader<'t> {
             letters_count: None,
             color_pair: 1,
             totlines_per_content: Vec::new(),
+            pad_top,
+            pad_bottom,
             top_pad: 0,
         }
     }
@@ -254,6 +265,17 @@ impl<'t> Reader<'t> {
         (s.height as i64, s.width as i64)
     }
 
+    /// Book title from metadata, or the file name if there is none.
+    fn book_title(&self) -> String {
+        let title = self.ebook.get_meta().title.map(|t| strip_tags(&t)).unwrap_or_default();
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !title.is_empty() {
+            return title;
+        }
+        let path = self.ebook.path();
+        path.trim_end_matches('/').rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+    }
+
     /// Progress indicator text, rounded down so 100.0% only shows at the very end.
     fn progress_label(&self) -> Option<String> {
         self.reading_progress
@@ -263,14 +285,26 @@ impl<'t> Reader<'t> {
 
     /// Screen rows available for text.
     fn text_rows(&self) -> i64 {
-        self.size().0 - self.top_pad
+        self.size().0 - self.top_pad - self.pad_bottom
     }
 
     /// The part of the screen the text is drawn in.
     fn text_area(&self) -> Rect {
         let (rows, cols) = self.size();
-        let pad = self.top_pad.clamp(0, rows.max(0));
-        Rect::new(0, pad as u16, cols.max(0) as u16, (rows - pad).max(0) as u16)
+        let top = self.top_pad.clamp(0, rows.max(0));
+        let height = (rows - top - self.pad_bottom).max(0);
+        Rect::new(0, top as u16, cols.max(0) as u16, height as u16)
+    }
+
+    /// Text rows covered by the bottom status line (eg. while searching):
+    /// none if it fits in the bottom padding.
+    fn status_rows(&self) -> i64 {
+        (self.pad_bottom == 0) as i64
+    }
+
+    /// Rows to reserve above the text for `pad_top`.
+    fn effective_top_pad(&self, pad_top: i64, textwidth: i64, cols: i64) -> i64 {
+        pad_top.max(self.needs_top_pad(textwidth, cols) as i64)
     }
 
     /// Whether the progress indicator needs its own row because it doesn't
@@ -400,6 +434,7 @@ impl<'t> Reader<'t> {
         title: &str,
         options: &[String],
         mut index: usize,
+        current: Option<usize>,
         own_keys: &[Key],
         allowdel: bool,
     ) -> Result<Choice> {
@@ -451,6 +486,7 @@ impl<'t> Reader<'t> {
                         &format!("Delete '{}'?", options[index]),
                         &["(Y)es".to_string(), "(N)o".to_string()],
                         0,
+                        None,
                         &[Key::Char('n')],
                         false,
                     )?;
@@ -483,7 +519,9 @@ impl<'t> Reader<'t> {
                     buf.set_stringn(4, 5, "HINT: Press 'd' to delete.", list_width, style);
                 }
                 for (n, opt) in options.iter().enumerate().skip(y).take(padhi) {
-                    let pre = if n == index { ">>" } else { "  " };
+                    // ">>" marks the current entry (eg. the chapter being read);
+                    // the selection is shown by highlighting alone
+                    let pre = if Some(n) == current { ">>" } else { "  " };
                     let text = format!("{pre}{}", opt.replace('\n', " "));
                     let text: String = text.chars().take(list_width).collect();
                     let s = if n == index { style.add_modifier(Modifier::REVERSED) } else { style };
@@ -656,7 +694,7 @@ impl<'t> Reader<'t> {
             if bookmarks.is_empty() {
                 return Ok((Some(own[0]), None));
             }
-            let choice = self.choice_win("Bookmarks", &bookmarks, idx.min(bookmarks.len() - 1), &own, true)?;
+            let choice = self.choice_win("Bookmarks", &bookmarks, idx.min(bookmarks.len() - 1), None, &own, true)?;
             match choice.delete {
                 Some(todel) => {
                     self.state.delete_bookmark(&path, &bookmarks[todel])?;
@@ -675,7 +713,8 @@ impl<'t> Reader<'t> {
                 return Ok((Some(own[0]), None));
             }
             let labels: Vec<String> = items.iter().map(|i| i.to_string()).collect();
-            let choice = self.choice_win("Library", &labels, 0, &own, true)?;
+            let current = items.iter().position(|i| i.filepath == self.ebook.path());
+            let choice = self.choice_win("Library", &labels, 0, current, &own, true)?;
             match choice.delete {
                 Some(todel) => self.state.delete_from_library(&items[todel].filepath)?,
                 None => return Ok((choice.key, choice.index)),
@@ -774,11 +813,12 @@ impl<'t> Reader<'t> {
     fn draw_with_status(&mut self, board: &Board, rs: &ReadingState, letters_prefix: &[usize], msg: &str) -> Result<()> {
         let msg = msg.to_string();
         let text_area = self.text_area();
+        let status_rows = self.status_rows() as usize;
         self.calculate_reading_progress(letters_prefix, rs);
         let progress = self.progress_label();
         self.draw_screen(|f, style| {
             let area = f.area();
-            board.render(f.buffer_mut(), text_area, rs.row.max(0) as usize, 1, style);
+            board.render(f.buffer_mut(), text_area, rs.row.max(0) as usize, status_rows, style);
             if let Some(p) = progress {
                 f.buffer_mut().set_string(area.width.saturating_sub(p.len() as u16), 0, &p, style);
             }
@@ -877,7 +917,7 @@ impl<'t> Reader<'t> {
         };
         let mut msg = progress_msg(sidx);
         let mut s: Option<Key> = None;
-        let page = ((rows - 1) * self.spread).max(1);
+        let page = ((rows - self.status_rows()) * self.spread).max(1);
         loop {
             if self.keymap.has(Action::Quit, s) {
                 self.search_data = None;
@@ -1031,11 +1071,18 @@ impl<'t> Reader<'t> {
 
     /// `letters_prefix[i]`: letters in the first `i` lines of the text.
     fn calculate_reading_progress(&mut self, letters_prefix: &[usize], rs: &ReadingState) {
-        let rows = self.text_rows();
+        let page = self.text_rows() * self.spread;
+        let totlines = letters_prefix.len() as i64 - 1;
+        let is_last_content = self.seamless || rs.content_index + 1 >= self.ebook.contents().len();
         if let Some(lc) = self.letters_count.as_ref().filter(|lc| lc.all > 0) {
-            let cum = lc.cumulative.get(rs.content_index).copied().unwrap_or(0);
-            let upto = (rs.row + rows * self.spread - 1).clamp(0, letters_prefix.len() as i64 - 1) as usize;
-            self.reading_progress = Some((cum + letters_prefix[upto]) as f64 / lc.all as f64);
+            // letters before the top of the page; 100% once the end of the book is on screen
+            self.reading_progress = Some(if is_last_content && rs.row + page >= totlines {
+                1.0
+            } else {
+                let cum = lc.cumulative.get(rs.content_index).copied().unwrap_or(0);
+                let top = rs.row.clamp(0, totlines) as usize;
+                (cum + letters_prefix[top]) as f64 / lc.all as f64
+            });
         }
     }
 
@@ -1171,10 +1218,17 @@ impl<'t> Reader<'t> {
             return Ok(GoToTarget::Unavailable);
         };
         let target = (pct / 100.0 * lc.all as f64).round() as usize;
-        let page = self.text_rows() * self.spread - 1;
+        let page = self.text_rows() * self.spread;
+        // rows can go down to the last line of a content, but in the last
+        // content only to its last full page
+        let max_row = |prefix: &[usize], last: bool| {
+            let totlines = prefix.len() as i64 - 1;
+            if last { pgend(totlines, page) } else { totlines - 1 }
+        };
         if self.seamless {
             // the whole book is loaded as one text
-            return Ok(GoToTarget::Row(row_for_letters(letters_prefix, target, page)));
+            let row = row_for_letters(letters_prefix, target, max_row(letters_prefix, true));
+            return Ok(GoToTarget::Row(row));
         }
 
         let n = lc.cumulative.len();
@@ -1186,13 +1240,15 @@ impl<'t> Reader<'t> {
             (0..n).find(|&i| end(i) >= target && end(i) > lc.cumulative[i]).unwrap_or(n - 1)
         };
         let local = target - lc.cumulative[ci].min(target);
+        let last = ci == n - 1;
         if ci == rs.content_index {
-            return Ok(GoToTarget::Row(row_for_letters(letters_prefix, local, page)));
+            return Ok(GoToTarget::Row(row_for_letters(letters_prefix, local, max_row(letters_prefix, last))));
         }
         let content = self.ebook.contents()[ci].clone();
         let html = self.ebook.get_raw_text(&content)?;
         let ts = parse_html(&html, rs.textwidth.max(1) as usize, &HashSet::new(), 0);
-        let row = row_for_letters(&letters_prefix_of(&ts.text_lines), local, page);
+        let prefix = letters_prefix_of(&ts.text_lines);
+        let row = row_for_letters(&prefix, local, max_row(&prefix, last));
         Ok(GoToTarget::State(ReadingState::new(ci, rs.textwidth, row)))
     }
 
@@ -1223,7 +1279,7 @@ impl<'t> Reader<'t> {
     pub fn read(&mut self, mut rs: ReadingState) -> Result<ReadOutcome> {
         let km = self.keymap.clone();
         let mut k: Option<Key> = self.search_data.as_ref().map(|_| km.first(Action::RegexSearch));
-        let (mut rows, mut cols) = self.size();
+        let mut cols = self.size().1;
 
         let mincols_doublespr = DOUBLE_SPREAD_PADDING_LEFT + 22 + DOUBLE_SPREAD_PADDING_MIDDLE + 22 + DOUBLE_SPREAD_PADDING_RIGHT;
         if cols < mincols_doublespr {
@@ -1233,8 +1289,8 @@ impl<'t> Reader<'t> {
             rs.textwidth = (cols - DOUBLE_SPREAD_PADDING_LEFT - DOUBLE_SPREAD_PADDING_MIDDLE - DOUBLE_SPREAD_PADDING_RIGHT) / 2;
         }
         let x = if self.spread == 2 { DOUBLE_SPREAD_PADDING_LEFT } else { (cols - rs.textwidth) / 2 };
-        self.top_pad = self.needs_top_pad(rs.textwidth, cols) as i64;
-        rows -= self.top_pad;
+        self.top_pad = self.effective_top_pad(self.pad_top, rs.textwidth, cols);
+        let mut rows = self.text_rows();
 
         self.show_loader("loading contents")?;
         let (mut ts, toc_entries, contents) = if self.seamless {
@@ -1425,7 +1481,16 @@ impl<'t> Reader<'t> {
                         continue;
                     }
                     let labels: Vec<String> = toc_entries.iter().map(|e| e.label.clone()).collect();
-                    let choice = self.choice_win("Table of Contents", &labels, ntoc(), km.get(Action::TableOfContents), false)?;
+                    let current = ntoc();
+                    let title = format!("Table of Contents \u{2014} {}", self.book_title());
+                    let choice = self.choice_win(
+                        &title,
+                        &labels,
+                        current,
+                        Some(current),
+                        km.get(Action::TableOfContents),
+                        false,
+                    )?;
                     if choice.key.is_some() {
                         k = choice.key;
                         continue;
@@ -1663,8 +1728,18 @@ impl<'t> Reader<'t> {
                     }
                 } else if km.has(Action::ShowHideProgress, k) {
                     self.show_reading_progress = !self.show_reading_progress;
-                    if self.needs_top_pad(rs.textwidth, cols) != (self.top_pad > 0) {
-                        return Ok(ReadOutcome::State(with_pctg(&rs)));
+                    self.top_pad = self.effective_top_pad(self.pad_top, rs.textwidth, cols);
+                    rows = self.text_rows();
+                } else if km.has(Action::TopPadding, k) || km.has(Action::BottomPadding, k) {
+                    let top = km.has(Action::TopPadding, k);
+                    let current = if top { self.pad_top } else { self.pad_bottom };
+                    let next = PADDING_LEVELS.iter().copied().find(|&l| l > current).unwrap_or(PADDING_LEVELS[0]);
+                    let (pad_top, pad_bottom) = if top { (next, self.pad_bottom) } else { (self.pad_top, next) };
+                    let top_pad = self.effective_top_pad(pad_top, rs.textwidth, cols);
+                    // skip a step that would leave too little room for text
+                    if self.size().0 - top_pad - pad_bottom >= MIN_TEXT_ROWS {
+                        (self.pad_top, self.pad_bottom, self.top_pad) = (pad_top, pad_bottom, top_pad);
+                        rows = self.text_rows();
                     }
                 } else if km.has(Action::Library, k) {
                     self.try_assign_letters_count(true);
@@ -1814,15 +1889,17 @@ mod tests {
     }
 
     #[test]
-    fn row_for_letters_targets_bottom_of_page() {
+    fn row_for_letters_targets_top_of_page() {
         // 10 lines of 10 letters each
         let prefix: Vec<usize> = (0..=10).map(|i| i * 10).collect();
-        // page of 3 lines (page = 2): 50 letters reached after line 5 -> row 3
-        assert_eq!(row_for_letters(&prefix, 50, 2), 3);
-        assert_eq!(row_for_letters(&prefix, 0, 2), 0);
-        assert_eq!(row_for_letters(&prefix, 5, 2), 0);
-        assert_eq!(row_for_letters(&prefix, 100, 2), 8);
-        assert_eq!(row_for_letters(&prefix, 1000, 2), 9);
+        assert_eq!(row_for_letters(&prefix, 0, 9), 0);
+        // 50 letters come before line 5
+        assert_eq!(row_for_letters(&prefix, 50, 9), 5);
+        // mid-line targets round forward to the next line
+        assert_eq!(row_for_letters(&prefix, 45, 9), 5);
+        // clamped to the last allowed row
+        assert_eq!(row_for_letters(&prefix, 100, 9), 9);
+        assert_eq!(row_for_letters(&prefix, 100, 7), 7);
     }
 
     #[test]

@@ -26,6 +26,10 @@ pub struct Settings {
     pub page_scroll_animation: bool,
     /// Delay in milliseconds between frames of the page-turn animation
     pub page_scroll_animation_rate: u64,
+    /// Blank rows above the text
+    pub top_padding: i64,
+    /// Blank rows below the text
+    pub bottom_padding: i64,
     pub mouse_support: bool,
     pub start_with_double_spread: bool,
     /// -1 is the default terminal fg/bg color
@@ -56,6 +60,8 @@ impl Default for Settings {
             show_progress_indicator: true,
             page_scroll_animation: true,
             page_scroll_animation_rate: 0,
+            top_padding: 0,
+            bottom_padding: 0,
             mouse_support: false,
             start_with_double_spread: false,
             default_color_fg: -1,
@@ -134,6 +140,8 @@ actions! {
     MarkPosition = "m",
     JumpToPosition = "`",
     GoToPercent = "%",
+    TopPadding = ",",
+    BottomPadding = ".",
     AddBookmark = "b",
     ShowBookmarks = "B",
     Quit = "q",
@@ -149,7 +157,7 @@ fn builtin_keys(action: Action) -> &'static [Key] {
     match action {
         Action::ScrollUp => &[Up],
         Action::ScrollDown => &[Down],
-        Action::PageUp => &[Key::PageUp, Left],
+        Action::PageUp => &[Key::PageUp, Left, Backspace],
         Action::PageDown => &[Key::PageDown, Char(' '), Right],
         Action::BeginningOfCh => &[Home],
         Action::EndOfCh => &[End],

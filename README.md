@@ -29,7 +29,7 @@ Press `?` while reading to see all key bindings. The most common:
 | Key | Action |
 | --- | --- |
 | `j` / `k` | scroll down / up |
-| `l` / `h`, `Space` | next / previous page |
+| `l` / `h`, `Space` / `Backspace` | next / previous page |
 | `L` / `H` | next / previous chapter |
 | `t` | table of contents |
 | `%` | go to a percentage of the book (Enter to jump, Esc to cancel) |
@@ -37,6 +37,7 @@ Press `?` while reading to see all key bindings. The most common:
 | `-` / `+` | narrower / wider page (10 columns per press) |
 | `=` | toggle between 80 columns and full width |
 | `D` | toggle double-page spread |
+| `,` / `.` | cycle top / bottom padding (0, 2, 4, 8 rows) |
 | `b` / `B` | add bookmark / show bookmarks |
 | `R` | library |
 | `q` | quit |
