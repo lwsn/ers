@@ -322,6 +322,36 @@ impl<'t> Reader<'t> {
         Style::default().fg(color(fg)).bg(color(bg))
     }
 
+    /// Ctrl+Z: give the terminal back to the shell and stop like any other
+    /// job (raw mode keeps the terminal from doing this itself). Once resumed
+    /// with `fg`, take the terminal back and clear it for a full repaint.
+    fn suspend(&mut self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use ratatui::crossterm::{cursor, execute, terminal};
+            let mut out = std::io::stdout();
+            if self.setting.mouse_support {
+                execute!(out, event::DisableMouseCapture)?;
+            }
+            execute!(out, terminal::LeaveAlternateScreen, cursor::Show)?;
+            terminal::disable_raw_mode()?;
+
+            // SAFETY: raising a signal on the current process; the default
+            // SIGTSTP action stops us here until SIGCONT
+            unsafe {
+                libc::raise(libc::SIGTSTP);
+            }
+
+            terminal::enable_raw_mode()?;
+            execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
+            if self.setting.mouse_support {
+                execute!(out, event::EnableMouseCapture)?;
+            }
+            self.term.clear()?;
+        }
+        Ok(())
+    }
+
     fn read_input(&mut self, timeout: Option<Duration>) -> Result<Option<Input>> {
         loop {
             if let Some(t) = timeout
@@ -335,6 +365,12 @@ impl<'t> Reader<'t> {
                     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                     match k.code {
                         KeyCode::Char('c') if ctrl => Key::CtrlC,
+                        KeyCode::Char('z') if ctrl && cfg!(unix) => {
+                            self.suspend()?;
+                            // everything needs redrawing (and the terminal may
+                            // have been resized meanwhile)
+                            Key::Resize
+                        }
                         KeyCode::Char(_) if ctrl => continue,
                         KeyCode::Char(c) => Key::Char(c),
                         KeyCode::Up => Key::Up,

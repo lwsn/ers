@@ -24,3 +24,6 @@ tempfile = "3.27.0"
 unicode-width = "0.2.2"
 ureq = "3.4.2"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.190"
