@@ -4,8 +4,8 @@ A terminal ebook reader written in Rust. It is a port of
 [epy](https://github.com/wustho/epy) by wustho, built on
 [ratatui](https://ratatui.rs).
 
-Supported formats: EPUB (2 and 3), FictionBook (`.fb2`) and HTML pages by URL.
-MOBI/AZW are not supported yet.
+Supported formats: EPUB (2 and 3), MOBI/AZW/AZW3 (DRM-free), FictionBook
+(`.fb2`) and HTML pages by URL.
 
 ## Install
 

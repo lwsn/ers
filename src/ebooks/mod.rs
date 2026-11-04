@@ -2,12 +2,14 @@
 
 mod epub;
 mod fictionbook;
+mod mobi;
 mod url;
 
 use anyhow::{Result, bail};
 
 pub use epub::Epub;
 pub use fictionbook::FictionBook;
+pub use mobi::Mobi;
 pub use url::Url;
 
 use crate::models::{BookMetadata, TocEntry};
@@ -54,8 +56,8 @@ pub fn get_ebook_obj(filepath: &str) -> Result<Box<dyn Ebook>> {
     match ext.as_str() {
         "epub" | "epub3" => Ok(Box::new(Epub::open(filepath)?)),
         "fb2" => Ok(Box::new(FictionBook::new(filepath)?)),
-        "mobi" | "azw" | "azw3" => bail!("Format not supported yet: {ext} (Supported: epub, fb2)"),
-        _ => bail!("Format not supported. (Supported: epub, fb2)"),
+        "mobi" | "azw" | "azw3" | "prc" => Ok(Box::new(Mobi::new(filepath)?)),
+        _ => bail!("Format not supported. (Supported: epub, fb2, mobi, azw, azw3)"),
     }
 }
 
