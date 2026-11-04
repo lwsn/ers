@@ -50,6 +50,12 @@ Settings and key bindings live in `~/.config/ers/configuration.json`
 (or `~/.ers/` if `~/.config` doesn't exist), created on first run. Reading
 positions, bookmarks and history are stored in `states.db` next to it.
 
+The text width (`-` / `+` / `=`) and paddings (`,` / `.`) are saved to the
+`Width`, `TopPadding` and `BottomPadding` settings when changed. With no
+`Width` set, the text fills the screen and follows it when the terminal is
+resized; a set width shrinks to fit a smaller screen and comes back when
+there's room again.
+
 ## License
 
 GPL-3.0-only, the same as epy. See [LICENSE](LICENSE).

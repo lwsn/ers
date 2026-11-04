@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use ratatui::DefaultTerminal;
@@ -19,7 +19,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::board::Board;
 use crate::config::{
-    Action, Config, DICT_PRESET_LIST, DOUBLE_SPREAD_PADDING_LEFT, DOUBLE_SPREAD_PADDING_MIDDLE,
+    save_layout, Action, Config, DICT_PRESET_LIST, DOUBLE_SPREAD_PADDING_LEFT, DOUBLE_SPREAD_PADDING_MIDDLE,
     DOUBLE_SPREAD_PADDING_RIGHT, Key, Keymap, Settings, VIEWER_PRESET_LIST,
 };
 use crate::ebooks::{Ebook, get_ebook_obj};
@@ -27,7 +27,6 @@ use crate::models::{
     Direction, InlineStyle, LettersCount, ReadingState, SearchData, TextStructure, TocEntry,
 };
 use crate::parser::{count_letters_in_html, decode_entities, parse_html};
-use crate::speakers::{Speaker, construct_speaker};
 use crate::state::State;
 use crate::util::{center, count_letters, is_url, resolve_path, shell_quote, str_width, which, wrap};
 
@@ -90,6 +89,101 @@ pub fn find_current_content_index(
     ntoc
 }
 
+/// Page turns made in quick succession with one key.
+struct PageRun {
+    key: Key,
+    /// time of the latest turn
+    last: Instant,
+    /// where the first turn started
+    origin: ReadingState,
+    /// whether `origin` is in the jump history yet
+    recorded: bool,
+}
+
+/// The progress indicators, drawn on the top or bottom row.
+struct Indicators {
+    bottom: bool,
+    left: String,
+    center: Option<String>,
+    right: String,
+}
+
+impl Indicators {
+    fn draw(&self, buf: &mut Buffer, style: Style) {
+        // faint: the terminal blends the text toward the background, so it
+        // recedes in any color scheme without picking colors ourselves
+        let style = style.add_modifier(Modifier::DIM);
+        let area = buf.area;
+        let y = if self.bottom { area.height.saturating_sub(1) } else { 0 };
+        let width = |s: &str| s.chars().count() as u16;
+        buf.set_string(0, y, &self.left, style);
+        let right_x = area.width.saturating_sub(width(&self.right));
+        buf.set_string(right_x, y, &self.right, style);
+        // centered on the screen, shortened to keep a gap to the others
+        if let Some(c) = &self.center {
+            let room = right_x.saturating_sub(width(&self.left)).saturating_sub(2);
+            let c = truncate_with_ellipsis(c, room as usize);
+            let x = (area.width.saturating_sub(width(&c)) / 2)
+                .clamp(width(&self.left) + 1, right_x.saturating_sub(width(&c) + 1).max(width(&self.left) + 1));
+            if !c.is_empty() {
+                buf.set_string(x, y, &c, style);
+            }
+        }
+    }
+}
+
+/// `s` cut to at most `max` chars, ending in "…" if shortened.
+fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else if max == 0 {
+        String::new()
+    } else {
+        s.chars().take(max - 1).chain(['…']).collect()
+    }
+}
+
+/// How many positions ctrl+o / ctrl+i can go back / forward.
+const JUMP_HISTORY_LEN: usize = 10;
+/// Longest pause between repeats of a jump key for them to count as one
+/// jump; above the usual key-repeat delay (eg. 660ms on X11).
+const JUMP_REPEAT_GAP: Duration = Duration::from_millis(750);
+
+static KEY_DISAMBIGUATION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Ask the terminal to report ctrl+i apart from Tab (kitty keyboard
+/// protocol), where supported. Call after entering the alternate screen,
+/// and pair with `disable_key_disambiguation` before leaving it.
+pub fn enable_key_disambiguation() {
+    use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+    use ratatui::crossterm::{execute, terminal};
+    if *KEY_DISAMBIGUATION.get_or_init(|| terminal::supports_keyboard_enhancement().unwrap_or(false)) {
+        let _ = execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
+}
+
+pub fn disable_key_disambiguation() {
+    use ratatui::crossterm::event::PopKeyboardEnhancementFlags;
+    if KEY_DISAMBIGUATION.get() == Some(&true) {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
+}
+
+/// Push `rs` onto `stack`, dropping the oldest entry when full and
+/// skipping it if it's where the newest entry already points.
+fn push_bounded(stack: &mut Vec<ReadingState>, rs: ReadingState) {
+    if stack.last().is_some_and(|l| l.content_index == rs.content_index && l.row == rs.row) {
+        return;
+    }
+    if stack.len() == JUMP_HISTORY_LEN {
+        stack.remove(0);
+    }
+    stack.push(rs);
+}
+
 fn pgup(current_row: i64, window_height: i64) -> i64 {
     (current_row - window_height).max(0)
 }
@@ -104,6 +198,16 @@ fn pgdn(current_row: i64, total_lines: i64, window_height: i64) -> i64 {
 
 fn pgend(total_lines: i64, window_height: i64) -> i64 {
     (total_lines - window_height).max(0)
+}
+
+/// First non-blank row at or after `row`, so pages don't start with empty
+/// lines. Returns `row` unchanged if only blank lines follow.
+fn skip_blank_rows(lines: &[String], row: i64) -> i64 {
+    let start = row.max(0) as usize;
+    lines
+        .get(start..)
+        .and_then(|rest| rest.iter().position(|l| !l.trim().is_empty()))
+        .map_or(row, |n| (start + n) as i64)
 }
 
 pub fn count_letters_of(ebook: &mut dyn Ebook) -> LettersCount {
@@ -161,6 +265,18 @@ fn parse_percent(input: &str) -> Option<f64> {
 /// Row to put at the top of the page so that the progress indicator (which
 /// counts the letters before the top of the page) reads at least `target`.
 /// `letters_prefix[i]` is the number of letters in the first `i` lines.
+/// Pages after the one starting at `row` until the chapter ends: at the
+/// first of `chapter_starts` (sorted) past `row`, or at `totlines`.
+fn pages_left_in_chapter(
+    chapter_starts: impl IntoIterator<Item = usize>,
+    row: usize,
+    totlines: usize,
+    page: usize,
+) -> usize {
+    let end = chapter_starts.into_iter().find(|&r| r > row).unwrap_or(totlines);
+    end.saturating_sub(row).div_ceil(page).saturating_sub(1)
+}
+
 fn row_for_letters(letters_prefix: &[usize], target: usize, max_row: i64) -> i64 {
     let row = letters_prefix.partition_point(|&p| p < target) as i64;
     row.clamp(0, max_row.max(0))
@@ -196,11 +312,26 @@ pub struct Reader<'t> {
     page_animation: Option<Direction>,
     show_reading_progress: bool,
     reading_progress: Option<f64>,
+    /// (row, TOC index) of the TOC sections starting in the loaded text,
+    /// sorted, to tell which chapter we're in and where it ends
+    chapter_starts: Vec<(usize, usize)>,
+    /// TOC index of the chapter the loaded text starts in, if it begins
+    /// before the first of `chapter_starts`
+    chapter_before: Option<usize>,
+    /// TOC entry labels, whitespace collapsed
+    toc_labels: Vec<String>,
     search_data: Option<SearchData>,
     spread: i64,
     jump_list: HashMap<char, ReadingState>,
-    tts: Option<Box<dyn Speaker>>,
-    is_speaking: bool,
+    /// positions before recent jumps (chapter, TOC, search, ...), newest
+    /// last, for ctrl+o
+    jump_history: Vec<ReadingState>,
+    /// positions left with ctrl+o, newest last, for ctrl+i
+    jump_forward: Vec<ReadingState>,
+    /// key and time of the latest jump, to tell a held key from new jumps
+    last_jump: Option<(Key, Instant)>,
+    /// the page turns in progress, to record a run of them as a jump
+    page_run: Option<PageRun>,
     letters_thread: Option<JoinHandle<LettersCount>>,
     letters_count: Option<LettersCount>,
     color_pair: u8,
@@ -224,10 +355,6 @@ impl<'t> Reader<'t> {
         for a in [Action::TableOfContents, Action::Metadata, Action::Help] {
             win_keys.extend_from_slice(keymap.get(a));
         }
-        let tts = construct_speaker(
-            config.setting.preferred_tts_engine.as_deref(),
-            &config.setting.tts_engine_args,
-        );
         Self {
             term,
             base: None,
@@ -242,10 +369,15 @@ impl<'t> Reader<'t> {
             state,
             page_animation: None,
             reading_progress: None,
+            chapter_starts: Vec::new(),
+            chapter_before: None,
+            toc_labels: Vec::new(),
             search_data: None,
             jump_list: HashMap::new(),
-            tts,
-            is_speaking: false,
+            jump_history: Vec::new(),
+            jump_forward: Vec::new(),
+            last_jump: None,
+            page_run: None,
             letters_thread: None,
             letters_count: None,
             color_pair: 1,
@@ -283,6 +415,47 @@ impl<'t> Reader<'t> {
             .map(|p| format!("{:.1}%", (p * 1000.0).floor() / 10.0))
     }
 
+    /// Pages left in the chapter after this one, eg. "-12p". A chapter ends
+    /// where the next TOC section starts, or with the content file.
+    fn chapter_label(&self, rs: &ReadingState, totlines: usize) -> Option<String> {
+        if !self.show_reading_progress {
+            return None;
+        }
+        let page = (self.text_rows() * self.spread).max(1) as usize;
+        let starts = self.chapter_starts.iter().map(|&(r, _)| r);
+        Some(format!("-{}p", pages_left_in_chapter(starts, rs.row.max(0) as usize, totlines, page)))
+    }
+
+    /// Title of the current chapter, from the TOC.
+    fn chapter_title(&self, rs: &ReadingState) -> Option<String> {
+        let row = rs.row.max(0) as usize;
+        let n = self.chapter_starts.iter().take_while(|&&(r, _)| r <= row).last().map(|&(_, n)| n);
+        n.or(self.chapter_before).and_then(|n| self.toc_labels.get(n)).filter(|l| !l.is_empty()).cloned()
+    }
+
+    /// Whether the indicators go on the bottom row instead of the top.
+    fn indicators_at_bottom(pad_top: i64, pad_bottom: i64) -> bool {
+        pad_bottom > pad_top
+    }
+
+    /// What goes on the indicator row: pages left in the chapter (or a
+    /// count being typed), the chapter title when the row is padding
+    /// rather than beside the text, and the book progress.
+    fn indicators(&self, rs: &ReadingState, totlines: usize, countstring: &str) -> Indicators {
+        let bottom = Self::indicators_at_bottom(self.pad_top, self.pad_bottom);
+        let row_is_padding = if bottom { self.pad_bottom > 0 } else { self.top_pad > 0 };
+        Indicators {
+            bottom,
+            left: if countstring.is_empty() {
+                self.chapter_label(rs, totlines).unwrap_or_default()
+            } else {
+                countstring.to_string()
+            },
+            center: self.chapter_title(rs).filter(|_| self.show_reading_progress && row_is_padding),
+            right: self.progress_label().unwrap_or_default(),
+        }
+    }
+
     /// Screen rows available for text.
     fn text_rows(&self) -> i64 {
         self.size().0 - self.top_pad - self.pad_bottom
@@ -302,9 +475,25 @@ impl<'t> Reader<'t> {
         (self.pad_bottom == 0) as i64
     }
 
-    /// Rows to reserve above the text for `pad_top`.
-    fn effective_top_pad(&self, pad_top: i64, textwidth: i64, cols: i64) -> i64 {
-        pad_top.max(self.needs_top_pad(textwidth, cols) as i64)
+    /// Single-page text width for a screen `cols` wide: the configured
+    /// width capped to the screen, or the full screen if none is set.
+    fn text_width(&self, cols: i64) -> i64 {
+        let max = (cols - 4).max(MIN_TEXTWIDTH);
+        self.setting.width.map_or(max, |w| w.clamp(MIN_TEXTWIDTH, max))
+    }
+
+    /// Remember the width and paddings for next time.
+    fn save_layout(&mut self) {
+        if let Err(e) = save_layout(self.setting.width, self.pad_top, self.pad_bottom) {
+            self.show_win_error("Error Saving Settings", &format!("{e:#}"), &[]).ok();
+        }
+    }
+
+    /// Rows to reserve above the text for `pad_top`, plus one for the
+    /// indicators if they go on top and don't fit beside the text.
+    fn effective_top_pad(&self, pad_top: i64, pad_bottom: i64, textwidth: i64, cols: i64) -> i64 {
+        let indicators_on_top = !Self::indicators_at_bottom(pad_top, pad_bottom);
+        pad_top.max((indicators_on_top && self.needs_top_pad(textwidth, cols)) as i64)
     }
 
     /// Whether the progress indicator needs its own row because it doesn't
@@ -333,6 +522,7 @@ impl<'t> Reader<'t> {
             if self.setting.mouse_support {
                 execute!(out, event::DisableMouseCapture)?;
             }
+            disable_key_disambiguation();
             execute!(out, terminal::LeaveAlternateScreen, cursor::Show)?;
             terminal::disable_raw_mode()?;
 
@@ -344,6 +534,7 @@ impl<'t> Reader<'t> {
 
             terminal::enable_raw_mode()?;
             execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
+            enable_key_disambiguation();
             if self.setting.mouse_support {
                 execute!(out, event::EnableMouseCapture)?;
             }
@@ -365,6 +556,9 @@ impl<'t> Reader<'t> {
                     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                     match k.code {
                         KeyCode::Char('c') if ctrl => Key::CtrlC,
+                        KeyCode::Char('o') if ctrl => Key::CtrlO,
+                        // only with key disambiguation, else it arrives as Tab
+                        KeyCode::Char('i') if ctrl => Key::CtrlI,
                         KeyCode::Char('z') if ctrl && cfg!(unix) => {
                             self.suspend()?;
                             // everything needs redrawing (and the terminal may
@@ -680,6 +874,8 @@ impl<'t> Reader<'t> {
         for (name, key) in &self.keymap_user {
             src += &format!("{key:>dig$}  {}\n", split_camel_case(name));
         }
+        src += &format!("{:>dig$}  Jump Back\n", "^O");
+        src += &format!("{:>dig$}  Jump Forward\n", "^I");
         let keys = self.keymap.get(Action::Help).to_vec();
         self.text_win("Help", &src, &keys)
     }
@@ -843,7 +1039,7 @@ impl<'t> Reader<'t> {
     }
 
     // -----------------------------------------------------------------
-    // search & tts
+    // search
     // -----------------------------------------------------------------
 
     fn draw_with_status(&mut self, board: &Board, rs: &ReadingState, letters_prefix: &[usize], msg: &str) -> Result<()> {
@@ -851,12 +1047,13 @@ impl<'t> Reader<'t> {
         let text_area = self.text_area();
         let status_rows = self.status_rows() as usize;
         self.calculate_reading_progress(letters_prefix, rs);
-        let progress = self.progress_label();
+        let indicators = self.indicators(rs, letters_prefix.len() - 1, "");
         self.draw_screen(|f, style| {
             let area = f.area();
             board.render(f.buffer_mut(), text_area, rs.row.max(0) as usize, status_rows, style);
-            if let Some(p) = progress {
-                f.buffer_mut().set_string(area.width.saturating_sub(p.len() as u16), 0, &p, style);
+            // the status line takes the bottom row
+            if !indicators.bottom {
+                indicators.draw(f.buffer_mut(), style);
             }
             let y = area.height.saturating_sub(1);
             f.buffer_mut().set_stringn(0, y, &msg, area.width as usize, style.add_modifier(Modifier::REVERSED));
@@ -1013,57 +1210,6 @@ impl<'t> Reader<'t> {
         }
     }
 
-    fn speaking(&mut self, text: &str) -> Result<Option<Key>> {
-        self.is_speaking = true;
-        self.draw_overlay(|f, style| {
-            let y = f.area().height.saturating_sub(1);
-            f.buffer_mut().set_string(0, y, " Speaking! ", style.add_modifier(Modifier::REVERSED));
-        })?;
-        let Some(speaker) = self.tts.as_mut() else {
-            self.is_speaking = false;
-            return Ok(None);
-        };
-        if let Err(e) = speaker.speak(text) {
-            speaker.cleanup();
-            self.is_speaking = false;
-            return self.show_win_error("TTS Error", &format!("{e:#}"), &[]);
-        }
-
-        let km = self.keymap.clone();
-        let (_, cols) = self.size();
-        let stop_keys = [Action::Quit, Action::PageUp, Action::PageDown, Action::ScrollUp, Action::ScrollDown];
-        let k = loop {
-            if self.tts.as_mut().unwrap().is_done() {
-                break Some(km.first(Action::PageDown));
-            }
-            let key = match self.read_input(Some(Duration::from_millis(50)))? {
-                Some(Input::Key(k)) => Some(k),
-                Some(Input::Mouse(m)) => match m.kind {
-                    MouseEventKind::Down(MouseButton::Middle) => Some(km.first(Action::Quit)),
-                    MouseEventKind::Down(MouseButton::Left) if (m.column as i64) < cols / 2 => {
-                        Some(km.first(Action::PageUp))
-                    }
-                    MouseEventKind::Down(MouseButton::Left) => Some(km.first(Action::PageDown)),
-                    MouseEventKind::ScrollUp => Some(km.first(Action::ScrollUp)),
-                    MouseEventKind::ScrollDown => Some(km.first(Action::ScrollDown)),
-                    _ => None,
-                },
-                None => None,
-            };
-            if key == Some(Key::Resize) || stop_keys.iter().any(|a| km.has(*a, key)) {
-                self.tts.as_mut().unwrap().stop();
-                break key;
-            }
-        };
-        self.tts.as_mut().unwrap().cleanup();
-
-        if km.has(Action::Quit, k) {
-            self.is_speaking = false;
-            return Ok(None);
-        }
-        Ok(k)
-    }
-
     // -----------------------------------------------------------------
     // state
     // -----------------------------------------------------------------
@@ -1209,10 +1355,16 @@ impl<'t> Reader<'t> {
     }
 
     fn render_page(&mut self, board: &Board, rs: &ReadingState, countstring: &str, letters_prefix: &[usize]) -> Result<()> {
-        if let Some(direction) = self.page_animation.take().filter(|_| self.setting.page_scroll_animation) {
+        let rate = self.setting.page_scroll_animation_rate;
+        // with no delay between frames the animation takes no time at all
+        if let Some(direction) = self.page_animation.take().filter(|_| self.setting.page_scroll_animation && rate > 0) {
             let style = self.base_style();
             let text_area = self.text_area();
-            for i in 1..=rs.textwidth.max(0) as usize {
+            let width = rs.textwidth.max(0) as usize;
+            let start = Instant::now();
+            // the last frame is the whole page, drawn below anyway
+            let mut i = 1;
+            while i < width {
                 // a pending key press cuts the animation short; the key is
                 // left in the queue so the main loop handles it right away
                 if event::poll(Duration::ZERO)? {
@@ -1223,27 +1375,22 @@ impl<'t> Reader<'t> {
                     f.buffer_mut().set_style(area, style);
                     board.render_partial(f.buffer_mut(), text_area, rs.row as usize, i, direction, style);
                 })?;
-                if self.setting.page_scroll_animation_rate > 0 {
-                    std::thread::sleep(Duration::from_millis(self.setting.page_scroll_animation_rate));
-                }
+                let due = start + Duration::from_millis(rate * i as u64);
+                std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                // skip the frames a slow terminal fell behind on, so it
+                // doesn't drag the animation out
+                i = (i + 1).max((start.elapsed().as_millis() / rate as u128) as usize + 1);
             }
         }
 
         self.try_assign_letters_count(false);
         self.calculate_reading_progress(letters_prefix, rs);
 
-        // when it doesn't fit beside the text, read() reserves the top row for it
-        let progress = self.progress_label();
-        let countstring = countstring.to_string();
+        let indicators = self.indicators(rs, letters_prefix.len() - 1, countstring);
         let text_area = self.text_area();
         self.draw_screen(|f, style| {
-            let area = f.area();
             board.render(f.buffer_mut(), text_area, rs.row.max(0) as usize, 0, style);
-            f.buffer_mut().set_string(0, 0, &countstring, style);
-            if let Some(p) = progress {
-                let x = area.width.saturating_sub(p.len() as u16);
-                f.buffer_mut().set_string(x, 0, &p, style);
-            }
+            indicators.draw(f.buffer_mut(), style);
         })
     }
 
@@ -1308,6 +1455,85 @@ impl<'t> Reader<'t> {
         self.read_input(None)
     }
 
+    /// Remember `rs` as a place to jump back to with ctrl+o. A new jump
+    /// starts a new branch, so there's nothing left to go forward to.
+    ///
+    /// Repeats of the same jump `key` in quick succession (eg. holding `L`)
+    /// count as one jump, remembered from where the first one started.
+    /// Jumps picked in a prompt or window pass `None` and never merge.
+    fn push_jump(&mut self, rs: ReadingState, key: Option<Key>) {
+        let now = Instant::now();
+        let repeat = self.last_jump.is_some_and(|(k, t)| Some(k) == key && now - t < JUMP_REPEAT_GAP);
+        self.last_jump = key.map(|k| (k, now));
+        if repeat {
+            return;
+        }
+        push_bounded(&mut self.jump_history, rs);
+        self.jump_forward.clear();
+    }
+
+    /// A page turn away from `origin`. Turning a single page is reading,
+    /// not jumping, so only a run of quick turns with the same key (eg.
+    /// holding it) or a counted one (eg. `5h`) is remembered for ctrl+o,
+    /// from where it started.
+    fn note_page_turn(&mut self, origin: ReadingState, key: Option<Key>, count: i64) {
+        let Some(key) = key else { return };
+        if count > 1 {
+            self.page_run = None;
+            self.push_jump(origin, None);
+            return;
+        }
+        let now = Instant::now();
+        match &mut self.page_run {
+            Some(run) if run.key == key && now - run.last < JUMP_REPEAT_GAP => {
+                run.last = now;
+                if !run.recorded {
+                    run.recorded = true;
+                    let origin = run.origin.clone();
+                    self.push_jump(origin, None);
+                }
+            }
+            _ => self.page_run = Some(PageRun { key, last: now, origin, recorded: false }),
+        }
+    }
+
+    /// Step through the jump history: back (ctrl+o) or forward (ctrl+i),
+    /// remembering `current` so the opposite key returns to it.
+    fn step_jump_history(&mut self, back: bool, current: ReadingState) -> Option<ReadingState> {
+        let (from, to) = if back {
+            (&mut self.jump_history, &mut self.jump_forward)
+        } else {
+            (&mut self.jump_forward, &mut self.jump_history)
+        };
+        let target = from.pop()?;
+        push_bounded(to, current);
+        Some(target)
+    }
+
+    /// Block while the screen is too small to read on (eg. 0x0 while a
+    /// window manager moves the window between monitors). Returns the new
+    /// (rows, cols), or `None` if the user quit meanwhile.
+    fn wait_for_usable_size(&mut self) -> Result<Option<(i64, i64)>> {
+        loop {
+            let (rows, cols) = self.size();
+            if cols >= 22 && rows >= 12 {
+                return Ok(Some((rows, cols)));
+            }
+            let style = self.base_style();
+            self.term.draw(|f| {
+                let area = f.area();
+                f.buffer_mut().set_style(area, style);
+                f.buffer_mut().set_stringn(0, 0, "Screen too small (min 22x12)", area.width as usize, style);
+            })?;
+            if let Some(Input::Key(k)) = self.read_input(None)?
+                && self.keymap.has(Action::Quit, Some(k))
+                && k != Key::Esc
+            {
+                return Ok(None);
+            }
+        }
+    }
+
     // -----------------------------------------------------------------
     // main loop
     // -----------------------------------------------------------------
@@ -1323,9 +1549,11 @@ impl<'t> Reader<'t> {
         }
         if self.spread == 2 {
             rs.textwidth = (cols - DOUBLE_SPREAD_PADDING_LEFT - DOUBLE_SPREAD_PADDING_MIDDLE - DOUBLE_SPREAD_PADDING_RIGHT) / 2;
+        } else {
+            rs.textwidth = self.text_width(cols);
         }
         let x = if self.spread == 2 { DOUBLE_SPREAD_PADDING_LEFT } else { (cols - rs.textwidth) / 2 };
-        self.top_pad = self.effective_top_pad(self.pad_top, rs.textwidth, cols);
+        self.top_pad = self.effective_top_pad(self.pad_top, self.pad_bottom, rs.textwidth, cols);
         let mut rows = self.text_rows();
 
         self.show_loader("loading contents")?;
@@ -1339,6 +1567,17 @@ impl<'t> Reader<'t> {
         ts.formatting.sort_by_key(|s| s.row);
         let ts = ts;
         let totlines = ts.text_lines.len() as i64;
+        // entries without a known section start with their content file
+        self.chapter_starts = toc_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.content_index == rs.content_index)
+            .map(|(n, e)| (e.section.as_ref().and_then(|s| ts.section_rows.get(s)).copied().unwrap_or(0), n))
+            .collect();
+        self.chapter_starts.sort_unstable();
+        self.chapter_before = toc_entries.iter().rposition(|e| e.content_index < rs.content_index);
+        self.toc_labels =
+            toc_entries.iter().map(|e| strip_tags(&e.label).split_whitespace().collect::<Vec<_>>().join(" ")).collect();
         let ncontents = contents.len();
 
         if rs.row < 0 && totlines <= rows * self.spread {
@@ -1364,6 +1603,13 @@ impl<'t> Reader<'t> {
         loop {
             let count: i64 = countstring.parse().unwrap_or(1);
             let ntoc = || find_current_content_index(&toc_entries, &ts.section_rows, rs.content_index, rs.row);
+            // any other key ends a run of repeated jumps or page turns
+            if self.last_jump.is_some_and(|(key, _)| k.is_some() && k != Some(key)) {
+                self.last_jump = None;
+            }
+            if self.page_run.as_ref().is_some_and(|run| k.is_some() && k != Some(run.key)) {
+                self.page_run = None;
+            }
 
             if let Some(d) = k.and_then(Key::digit) {
                 countstring.push(d);
@@ -1377,22 +1623,6 @@ impl<'t> Reader<'t> {
                         self.savestate(&with_pctg(&rs))?;
                         return Ok(ReadOutcome::Quit);
                     }
-                } else if km.has(Action::TTSToggle, k) && self.tts.is_some() {
-                    let mut tospeak = String::new();
-                    let end = (rs.row + rows * self.spread).min(totlines);
-                    for line in &ts.text_lines[rs.row as usize..end.max(rs.row) as usize] {
-                        if line.trim().is_empty() {
-                            tospeak += "\n. \n";
-                        } else {
-                            tospeak += line;
-                            tospeak += " ";
-                        }
-                    }
-                    k = self.speaking(&tospeak)?;
-                    if totlines - rs.row <= rows && rs.content_index == ncontents - 1 {
-                        self.is_speaking = false;
-                    }
-                    continue;
                 } else if km.has(Action::DoubleSpreadToggle, k) {
                     if cols < mincols_doublespr {
                         self.show_win_error(
@@ -1423,19 +1653,18 @@ impl<'t> Reader<'t> {
                         rs.row = 0;
                     }
                 } else if km.has(Action::PageUp, k) {
+                    if rs.row != 0 || rs.content_index != 0 {
+                        self.note_page_turn(with_pctg(&rs), k, count);
+                    }
                     if rs.row == 0 && rs.content_index != 0 {
                         self.page_animation = Some(Direction::Backward);
-                        let html = self.ebook.get_raw_text(&contents[rs.content_index - 1])?;
-                        let before = parse_html(&html, rs.textwidth.max(1) as usize, &HashSet::new(), 0);
+                        // a negative row counts from the end: read() puts the
+                        // last page of the previous chapter on screen
                         let page = (rows * self.spread).max(1);
-                        return Ok(ReadOutcome::State(ReadingState::new(
-                            rs.content_index - 1,
-                            rs.textwidth,
-                            page * (before.text_lines.len() as i64 / page),
-                        )));
+                        return Ok(ReadOutcome::State(ReadingState::new(rs.content_index - 1, rs.textwidth, -page)));
                     } else if rs.row >= rows * self.spread * count {
                         self.page_animation = Some(Direction::Backward);
-                        rs.row -= rows * self.spread * count;
+                        rs.row = skip_blank_rows(&ts.text_lines, rs.row - rows * self.spread * count);
                     } else {
                         rs.row = 0;
                     }
@@ -1454,9 +1683,12 @@ impl<'t> Reader<'t> {
                         return Ok(ReadOutcome::State(ReadingState::new(rs.content_index + 1, rs.textwidth, 0)));
                     }
                 } else if km.has(Action::PageDown, k) {
+                    if totlines - rs.row > rows * self.spread || rs.content_index != ncontents - 1 {
+                        self.note_page_turn(with_pctg(&rs), k, 1);
+                    }
                     if totlines - rs.row > rows * self.spread {
                         self.page_animation = Some(Direction::Forward);
-                        rs.row += rows * self.spread;
+                        rs.row = skip_blank_rows(&ts.text_lines, rs.row + rows * self.spread);
                     } else if rs.content_index != ncontents - 1 {
                         self.page_animation = Some(Direction::Forward);
                         return Ok(ReadOutcome::State(ReadingState::new(rs.content_index + 1, rs.textwidth, 0)));
@@ -1464,6 +1696,7 @@ impl<'t> Reader<'t> {
                 } else if km.has(Action::NextChapter, k) {
                     let ntoc = ntoc();
                     if ntoc + 1 < toc_entries.len() {
+                        self.push_jump(with_pctg(&rs), k);
                         let next = &toc_entries[ntoc + 1];
                         if rs.content_index == next.content_index {
                             if let Some(r) = next.section.as_ref().and_then(|s| ts.section_rows.get(s)) {
@@ -1479,6 +1712,7 @@ impl<'t> Reader<'t> {
                 } else if km.has(Action::PrevChapter, k) {
                     let ntoc = ntoc();
                     if ntoc > 0 {
+                        self.push_jump(with_pctg(&rs), k);
                         let prev = &toc_entries[ntoc - 1];
                         if rs.content_index == prev.content_index {
                             rs.row = prev.section.as_ref().and_then(|s| ts.section_rows.get(s)).copied().unwrap_or(0) as i64;
@@ -1490,6 +1724,7 @@ impl<'t> Reader<'t> {
                         }
                     }
                 } else if km.has(Action::BeginningOfCh, k) {
+                    self.push_jump(with_pctg(&rs), k);
                     let ntoc = ntoc();
                     rs.row = toc_entries
                         .get(ntoc)
@@ -1498,6 +1733,7 @@ impl<'t> Reader<'t> {
                         .copied()
                         .unwrap_or(0) as i64;
                 } else if km.has(Action::EndOfCh, k) {
+                    self.push_jump(with_pctg(&rs), k);
                     let ntoc = ntoc();
                     let section_row = |i: usize| {
                         toc_entries.get(i).and_then(|e| e.section.as_ref()).and_then(|s| ts.section_rows.get(s)).copied()
@@ -1531,6 +1767,7 @@ impl<'t> Reader<'t> {
                         k = choice.key;
                         continue;
                     } else if let Some(fllwd) = choice.index {
+                        self.push_jump(with_pctg(&rs), None);
                         let entry = &toc_entries[fllwd];
                         if rs.content_index == entry.content_index {
                             rs.row = entry.section.as_ref().and_then(|s| ts.section_rows.get(s)).copied().unwrap_or(0) as i64;
@@ -1556,21 +1793,33 @@ impl<'t> Reader<'t> {
                     let max = (cols - 4).max(MIN_TEXTWIDTH);
                     let textwidth = (rs.textwidth + step).clamp(MIN_TEXTWIDTH, max);
                     if textwidth != rs.textwidth {
+                        self.setting.width = Some(textwidth);
+                        self.save_layout();
                         return Ok(ReadOutcome::State(ReadingState { textwidth, ..with_pctg(&rs) }));
                     }
                 } else if km.has(Action::SetWidth, k) && self.spread == 1 {
-                    let textwidth = if countstring.is_empty() {
-                        // without a count, toggle between 80 cols and full width
-                        if rs.textwidth != 80 && cols - 4 >= 80 { 80 } else { cols - 4 }
+                    self.setting.width = if countstring.is_empty() {
+                        // without a count, toggle between 80 cols and
+                        // following the screen width
+                        if self.setting.width.is_none() { Some(80) } else { None }
                     } else {
-                        count.clamp(MIN_TEXTWIDTH, (cols - 4).max(MIN_TEXTWIDTH))
+                        Some(count.max(MIN_TEXTWIDTH))
                     };
+                    self.save_layout();
+                    let textwidth = self.text_width(cols);
                     return Ok(ReadOutcome::State(ReadingState {
                         rel_pctg: Some(rs.row as f64 / totlines as f64),
                         ..ReadingState::new(rs.content_index, textwidth, rs.row)
                     }));
                 } else if km.has(Action::RegexSearch, k) {
-                    match self.searching(&mut board, &ts.text_lines, &letters_prefix, rs.clone(), ncontents)? {
+                    // a search continuing from another chapter already
+                    // recorded where it started
+                    let origin = self.search_data.is_none().then(|| with_pctg(&rs));
+                    let outcome = self.searching(&mut board, &ts.text_lines, &letters_prefix, rs.clone(), ncontents)?;
+                    if let (Some(origin), SearchOutcome::State(_)) = (origin, &outcome) {
+                        self.push_jump(origin, None);
+                    }
+                    match outcome {
                         SearchOutcome::Key(key) => {
                             k = key;
                             continue;
@@ -1675,6 +1924,7 @@ impl<'t> Reader<'t> {
                         k = retk;
                         continue;
                     } else if let Some(idx) = idxchoice {
+                        self.push_jump(with_pctg(&rs), None);
                         let bookmark = self.state.get_bookmarks(&path)?.swap_remove(idx).1;
                         if bookmark.content_index == rs.content_index && bookmark.textwidth == rs.textwidth {
                             rs = bookmark;
@@ -1716,6 +1966,7 @@ impl<'t> Reader<'t> {
                 } else if km.has(Action::JumpToPosition, k) {
                     match self.getch()?.and_then(Key::digit).and_then(|d| self.jump_list.get(&d).cloned()) {
                         Some(marked) => {
+                            self.push_jump(with_pctg(&rs), None);
                             let same_width = marked.textwidth == rs.textwidth;
                             return Ok(ReadOutcome::State(ReadingState {
                                 textwidth: rs.textwidth,
@@ -1741,8 +1992,14 @@ impl<'t> Reader<'t> {
                                 continue;
                             };
                             match self.go_to_percent(pct, &rs, &letters_prefix)? {
-                                GoToTarget::Row(row) => rs.row = row,
-                                GoToTarget::State(s) => return Ok(ReadOutcome::State(s)),
+                                GoToTarget::Row(row) => {
+                                    self.push_jump(with_pctg(&rs), None);
+                                    rs.row = row;
+                                }
+                                GoToTarget::State(s) => {
+                                    self.push_jump(with_pctg(&rs), None);
+                                    return Ok(ReadOutcome::State(s));
+                                }
                                 GoToTarget::Unavailable => {
                                     k = self.show_win_error(
                                         "Go To Percent",
@@ -1764,18 +2021,19 @@ impl<'t> Reader<'t> {
                     }
                 } else if km.has(Action::ShowHideProgress, k) {
                     self.show_reading_progress = !self.show_reading_progress;
-                    self.top_pad = self.effective_top_pad(self.pad_top, rs.textwidth, cols);
+                    self.top_pad = self.effective_top_pad(self.pad_top, self.pad_bottom, rs.textwidth, cols);
                     rows = self.text_rows();
                 } else if km.has(Action::TopPadding, k) || km.has(Action::BottomPadding, k) {
                     let top = km.has(Action::TopPadding, k);
                     let current = if top { self.pad_top } else { self.pad_bottom };
                     let next = PADDING_LEVELS.iter().copied().find(|&l| l > current).unwrap_or(PADDING_LEVELS[0]);
                     let (pad_top, pad_bottom) = if top { (next, self.pad_bottom) } else { (self.pad_top, next) };
-                    let top_pad = self.effective_top_pad(pad_top, rs.textwidth, cols);
+                    let top_pad = self.effective_top_pad(pad_top, pad_bottom, rs.textwidth, cols);
                     // skip a step that would leave too little room for text
                     if self.size().0 - top_pad - pad_bottom >= MIN_TEXT_ROWS {
                         (self.pad_top, self.pad_bottom, self.top_pad) = (pad_top, pad_bottom, top_pad);
                         rows = self.text_rows();
+                        self.save_layout();
                     }
                 } else if km.has(Action::Library, k) {
                     self.try_assign_letters_count(true);
@@ -1796,17 +2054,27 @@ impl<'t> Reader<'t> {
                             return Ok(ReadOutcome::OpenFile(item.filepath.clone()));
                         }
                     }
+                } else if k == Some(Key::CtrlO) || k == Some(Key::CtrlI) {
+                    if let Some(target) = self.step_jump_history(k == Some(Key::CtrlO), with_pctg(&rs)) {
+                        let same_width = target.textwidth == rs.textwidth;
+                        return Ok(ReadOutcome::State(ReadingState {
+                            textwidth: rs.textwidth,
+                            rel_pctg: if same_width { None } else { target.rel_pctg },
+                            section: None,
+                            ..target
+                        }));
+                    }
                 } else if k == Some(Key::Resize) {
                     self.savestate(&with_pctg(&rs))?;
-                    (rows, cols) = self.size();
-                    if cols < 22 || rows < 12 {
-                        bail!("Screen was too small (min 22cols x 12rows).");
-                    }
-                    let _ = rows;
-                    return Ok(ReadOutcome::State(if cols <= rs.textwidth + 4 {
+                    let Some(size) = self.wait_for_usable_size()? else {
+                        return Ok(ReadOutcome::Quit);
+                    };
+                    (_, cols) = size;
+                    let textwidth = self.text_width(cols);
+                    return Ok(ReadOutcome::State(if self.spread == 1 && textwidth != rs.textwidth {
                         ReadingState {
                             rel_pctg: Some(rs.row as f64 / totlines as f64),
-                            ..ReadingState::new(rs.content_index, cols - 4, rs.row)
+                            ..ReadingState::new(rs.content_index, textwidth, rs.row)
                         }
                     } else {
                         ReadingState::new(rs.content_index, rs.textwidth, rs.row)
@@ -1826,11 +2094,6 @@ impl<'t> Reader<'t> {
 
             self.render_page(&board, &rs, &countstring, &letters_prefix)?;
 
-            if self.is_speaking {
-                k = Some(km.first(Action::TTSToggle));
-                continue;
-            }
-
             k = match self.wait_input(&board, &rs, &countstring, &letters_prefix)? {
                 Some(Input::Key(key)) => Some(key),
                 Some(Input::Mouse(m)) => {
@@ -1841,7 +2104,6 @@ impl<'t> Reader<'t> {
                         }
                         MouseEventKind::Down(MouseButton::Left) => Some(km.first(Action::PageDown)),
                         MouseEventKind::Down(MouseButton::Right) => Some(km.first(Action::TableOfContents)),
-                        MouseEventKind::Down(MouseButton::Middle) => Some(km.first(Action::TTSToggle)),
                         MouseEventKind::ScrollUp if ctrl => Some(km.first(Action::Enlarge)),
                         MouseEventKind::ScrollDown if ctrl => Some(km.first(Action::Shrink)),
                         MouseEventKind::ScrollUp => Some(km.first(Action::ScrollUp)),
@@ -1874,11 +2136,12 @@ impl<'t> Reader<'t> {
         if cols < 22 || rows < 12 {
             bail!("Screen was too small (min 22cols x 12rows).");
         }
-        if cols <= rs.textwidth + 4 {
-            rs.textwidth = cols - 4;
-        } else {
+        // the saved row only holds for the width it was saved at
+        let textwidth = self.text_width(cols);
+        if textwidth == rs.textwidth {
             rs.rel_pctg = None;
         }
+        rs.textwidth = textwidth;
         if rs.content_index >= self.ebook.contents().len() {
             rs = ReadingState::new(0, rs.textwidth, 0);
         }
@@ -1939,9 +2202,55 @@ mod tests {
     }
 
     #[test]
+    fn jump_history_is_bounded_and_deduped() {
+        let mut stack = Vec::new();
+        for row in 0..15 {
+            push_bounded(&mut stack, ReadingState::new(0, 80, row));
+        }
+        assert_eq!(stack.len(), JUMP_HISTORY_LEN);
+        // oldest entries were dropped
+        assert_eq!(stack[0].row, 5);
+        push_bounded(&mut stack, ReadingState::new(0, 80, 14));
+        assert_eq!(stack.len(), JUMP_HISTORY_LEN);
+        assert_eq!(stack.last().unwrap().row, 14);
+    }
+
+    #[test]
+    fn truncates_with_ellipsis() {
+        assert_eq!(truncate_with_ellipsis("Chapter One", 20), "Chapter One");
+        assert_eq!(truncate_with_ellipsis("Chapter One", 11), "Chapter One");
+        assert_eq!(truncate_with_ellipsis("Chapter One", 8), "Chapter…");
+        assert_eq!(truncate_with_ellipsis("Chapter One", 0), "");
+    }
+
+    #[test]
+    fn counts_pages_left_in_chapter() {
+        // chapters start at rows 0, 100 and 250 of 300; 20-row pages
+        let starts = [0, 100, 250];
+        assert_eq!(pages_left_in_chapter(starts, 0, 300, 20), 4);
+        // a partial last page still counts
+        assert_eq!(pages_left_in_chapter(starts, 5, 300, 20), 4);
+        assert_eq!(pages_left_in_chapter(starts, 80, 300, 20), 0);
+        assert_eq!(pages_left_in_chapter(starts, 100, 300, 20), 7);
+        // last chapter runs to the end of the text
+        assert_eq!(pages_left_in_chapter(starts, 250, 300, 20), 2);
+        // no TOC: the whole content file is the chapter
+        assert_eq!(pages_left_in_chapter([], 0, 300, 20), 14);
+    }
+
+    #[test]
+    fn skips_blank_rows_at_page_top() {
+        let lines: Vec<String> = ["a", "", "  ", "b", ""].iter().map(|s| s.to_string()).collect();
+        assert_eq!(skip_blank_rows(&lines, 0), 0);
+        assert_eq!(skip_blank_rows(&lines, 1), 3);
+        // only blank lines left: stay put
+        assert_eq!(skip_blank_rows(&lines, 4), 4);
+    }
+
+    #[test]
     fn splits_camel_case() {
         assert_eq!(split_camel_case("TableOfContents"), "Table Of Contents");
-        assert_eq!(split_camel_case("TTSToggle"), "TTS Toggle");
+        assert_eq!(split_camel_case("HTMLView"), "HTML View");
         assert_eq!(split_camel_case("Quit"), "Quit");
     }
 

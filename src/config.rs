@@ -24,8 +24,12 @@ pub struct Settings {
     pub dictionary_client: String,
     pub show_progress_indicator: bool,
     pub page_scroll_animation: bool,
-    /// Delay in milliseconds between frames of the page-turn animation
+    /// Milliseconds per column of the page-turn animation; frames are
+    /// skipped if the terminal lags behind. 0 turns the animation off.
     pub page_scroll_animation_rate: u64,
+    /// Text width in columns, capped to the screen; unset follows the
+    /// screen width. Saved when changed with the Shrink/Enlarge/SetWidth keys.
+    pub width: Option<i64>,
     /// Blank rows above the text
     pub top_padding: i64,
     /// Blank rows below the text
@@ -46,10 +50,6 @@ pub struct Settings {
     #[serde(rename = "LightColorBG")]
     pub light_color_bg: i32,
     pub seamless_between_chapters: bool,
-    #[serde(rename = "PreferredTTSEngine")]
-    pub preferred_tts_engine: Option<String>,
-    #[serde(rename = "TTSEngineArgs")]
-    pub tts_engine_args: Vec<String>,
 }
 
 impl Default for Settings {
@@ -60,6 +60,7 @@ impl Default for Settings {
             show_progress_indicator: true,
             page_scroll_animation: true,
             page_scroll_animation_rate: 0,
+            width: None,
             top_padding: 0,
             bottom_padding: 0,
             mouse_support: false,
@@ -71,8 +72,6 @@ impl Default for Settings {
             light_color_fg: 238,
             light_color_bg: 253,
             seamless_between_chapters: false,
-            preferred_tts_engine: None,
-            tts_engine_args: Vec::new(),
         }
     }
 }
@@ -93,6 +92,8 @@ pub enum Key {
     Esc,
     Backspace,
     CtrlC,
+    CtrlO,
+    CtrlI,
     Resize,
 }
 
@@ -147,7 +148,6 @@ actions! {
     Quit = "q",
     Help = "?",
     SwitchColor = "c",
-    TTSToggle = "!",
     DoubleSpreadToggle = "D",
     Library = "R",
 }
@@ -200,6 +200,29 @@ struct ConfigFile<'a> {
     setting: &'a Settings,
     #[serde(rename = "Keymap")]
     keymap: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Write the width and paddings the user picked while reading back to the
+/// config file, leaving everything else in it as is.
+pub fn save_layout(width: Option<i64>, top_padding: i64, bottom_padding: i64) -> Result<()> {
+    let Some(path) = app_prefix().map(|p| p.join("configuration.json")) else {
+        return Ok(());
+    };
+    let mut json: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).with_context(|| format!("invalid config file {}", path.display()))?,
+        Err(_) => serde_json::json!({}),
+    };
+    let Some(root) = json.as_object_mut() else {
+        return Ok(());
+    };
+    let setting = root.entry("Setting").or_insert_with(|| serde_json::json!({}));
+    if let Some(setting) = setting.as_object_mut() {
+        setting.insert("Width".into(), width.into());
+        setting.insert("TopPadding".into(), top_padding.into());
+        setting.insert("BottomPadding".into(), bottom_padding.into());
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&json)?)?;
+    Ok(())
 }
 
 impl Config {
